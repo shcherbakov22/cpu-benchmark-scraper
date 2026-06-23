@@ -273,9 +273,9 @@ async def run_scraper(args):
     # Launch browser
     print("Launching Chrome...")
     browser = await uc.start(
-        headless=False,
+        headless=True,
         browser_executable_path='/usr/bin/vivaldi',
-        browser_args=['--no-first-run', '--no-default-browser-check'],
+        browser_args=['--no-first-run', '--no-default-browser-check', '--disable-gpu', '--disable-dev-shm-usage'],
     )
 
     success = 0
