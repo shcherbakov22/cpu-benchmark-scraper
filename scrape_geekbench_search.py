@@ -87,21 +87,55 @@ def sanitize_query(name):
     """Convert CPU name to a Geekbench search query.
 
     Strategies:
-    - Full name: "Intel Core i7-13700K"
-    - Short model: "i7-13700K"
-    - Model number only: "13700K"
+    - Intel: extract model (i7-13700K)
+    - AMD: extract model (Ryzen 5 5600X, Threadripper 3960X)
+    - Apple: extract chip name without core count (M4 Max, M3 Pro)
+    - Qualcomm: extract chip name (Snapdragon X Elite)
     """
     name = name.strip()
 
-    # Try to extract model number (most reliable for matching)
-    # Intel patterns: i3-12100, i5-13600K, i7-13700K, i9-13900K
-    # AMD patterns: Ryzen 5 5600X, Ryzen 7 5800X, Threadripper 3960X
-    m = re.search(r'(i[3-9]-\d+[A-Z]?|\d{4,5}[A-Z]?X?|Ryzen \d+ \d+[A-Z]?|Threadripper \d+[A-Z]?)', name)
+    # Apple Silicon: "Apple M4 Max 16-Core" → "M4 Max"
+    #                "Apple M3 Pro" → "M3 Pro"
+    m = re.search(r'(M\d+\s+(Max|Pro|Ultra))', name)
+    if m:
+        return m.group(1).strip()
+
+    # Intel: i3-12100, i5-13600K, i7-13700K, i9-13900K, Core Ultra 7 265K
+    m = re.search(r'(i[3-9]-\d+[A-Z]?)', name)
     if m:
         return m.group(1)
 
-    # Fallback: use last 2-3 words of the name
-    parts = name.split()
+    # Intel Core Ultra
+    m = re.search(r'(Core\s+Ultra\s+\d+\s+\d+[A-Z]?)', name)
+    if m:
+        return m.group(1)
+
+    # AMD Ryzen: "Ryzen 5 5600X", "Ryzen 7 5800X", "Ryzen AI 9 HX 370"
+    m = re.search(r'(Ryzen\s+AI\s+\d+\s+[A-Z]?\d+[A-Z]?|Ryzen\s+\d+\s+\d+[A-Z]?)', name)
+    if m:
+        return m.group(1)
+
+    # AMD Threadripper: "Threadripper 3960X", "Threadripper PRO 7995WX"
+    m = re.search(r'(Threadripper\s+(?:PRO\s+)?\d+[A-Z]?)', name)
+    if m:
+        return m.group(1)
+
+    # AMD EPYC: "EPYC 9654"
+    m = re.search(r'(EPYC\s+\d+[A-Z]?)', name)
+    if m:
+        return m.group(1)
+
+    # Qualcomm: "Snapdragon X Elite", "Snapdragon 8 Gen 3"
+    m = re.search(r'(Snapdragon\s+[A-Z0-9]+(?:\s+[A-Za-z]+)?)', name)
+    if m:
+        return m.group(1)
+
+    # Fallback: use last 2-3 words, strip core counts
+    # "AMD Ryzen 5 9600X 4500 MHz (6 cores)" → "Ryzen 5 9600X"
+    clean = re.sub(r'\d+-Core.*', '', name).strip()
+    clean = re.sub(r'\d+\s*MHz.*', '', clean).strip()
+    clean = re.sub(r'\(\d+\s*cores?.*', '', clean).strip()
+    parts = clean.split()
     if len(parts) >= 3:
         return ' '.join(parts[-3:])
     return ' '.join(parts[-2:]) if len(parts) >= 2 else parts[0]
@@ -171,37 +205,55 @@ async def scrape_cpu(browser, cpu_id, cpu_name, delay=DELAY_BETWEEN_QUERIES):
     ]
 
     for sort_field, direction, field in queries:
-        try:
-            url = SEARCH_URL.format(
-                query=query,
-                sort=sort_field,
-                direction=direction,
-            )
-            page = await browser.get(url)
-            await asyncio.sleep(5)  # Wait for page + Cloudflare
+        success = False
+        for attempt in range(3):  # Retry up to 3 times on Cloudflare block
+            try:
+                url = SEARCH_URL.format(
+                    query=query,
+                    sort=sort_field,
+                    direction=direction,
+                )
+                page = await browser.get(url)
+                await asyncio.sleep(6)  # Wait for page + Cloudflare
 
-            # Verify page loaded
-            title = await page.evaluate('document.title')
-            if 'Just a moment' in title or 'Checking your browser' in title:
-                result['error'] = f'Cloudflare blocked: {field}'
+                # Verify page loaded
+                title = await page.evaluate('document.title')
+                if 'Just a moment' in title or 'Checking your browser' in title:
+                    if attempt < 2:
+                        print(f"    (Cloudflare challenge on {field}, retry {attempt+1}...)")
+                        await asyncio.sleep(10 + attempt * 5)  # Longer wait on retry
+                        continue
+                    else:
+                        result['error'] = f'Cloudflare blocked after 3 retries: {field}'
+                        return result
+
+                html = await page.get_content()
+                parsed = parse_search_results(html)
+
+                if parsed:
+                    result[field] = parsed['single'] if 'single' in field else parsed['multi']
+                    if field == 'single_high':
+                        result['results_count'] = parsed['total_count']
+                    success = True
+                else:
+                    result['error'] = f'No results for {field} ({query})'
+                    return result
+
+                break  # Success, exit retry loop
+
+            except Exception as e:
+                if attempt < 2:
+                    print(f"    (Error on {field}: {e}, retry {attempt+1}...)")
+                    await asyncio.sleep(5)
+                    continue
+                result['error'] = f'{field}: {str(e)}'
                 return result
 
-            html = await page.get_content()
-            parsed = parse_search_results(html)
-
-            if parsed:
-                result[field] = parsed['single'] if 'single' in field else parsed['multi']
-                if field == 'single_high':
-                    result['results_count'] = parsed['total_count']
-            else:
-                result['error'] = f'No results for {field} ({query})'
-                return result
-
-            await asyncio.sleep(delay)
-
-        except Exception as e:
-            result['error'] = f'{field}: {str(e)}'
+        if not success:
+            result['error'] = f'{field}: all retries exhausted'
             return result
+
+        await asyncio.sleep(delay)
 
     return result
 
