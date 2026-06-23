@@ -110,18 +110,18 @@ def sanitize_query(name):
     if m:
         return m.group(1)
 
-    # AMD Ryzen: "Ryzen 5 5600X", "Ryzen 7 5800X", "Ryzen AI 9 HX 370"
-    m = re.search(r'(Ryzen\s+AI\s+\d+\s+[A-Z]?\d+[A-Z]?|Ryzen\s+\d+\s+\d+[A-Z]?)', name)
+    # AMD Ryzen: "Ryzen 5 5600X", "Ryzen 7 5800X", "Ryzen AI 9 HX 370", "Ryzen 9 9955HX3D"
+    m = re.search(r'(Ryzen\s+AI\s+\d+\s+[A-Z]+\s+\d+[A-Z]*|Ryzen\s+\d+\s+\d+[A-Z0-9]+)', name)
     if m:
         return m.group(1)
 
     # AMD Threadripper: "Threadripper 3960X", "Threadripper PRO 7995WX"
-    m = re.search(r'(Threadripper\s+(?:PRO\s+)?\d+[A-Z]?)', name)
+    m = re.search(r'(Threadripper\s+(?:PRO\s+)?\d+[A-Z]+)', name)
     if m:
         return m.group(1)
 
     # AMD EPYC: "EPYC 9654"
-    m = re.search(r'(EPYC\s+\d+[A-Z]?)', name)
+    m = re.search(r'(EPYC\s+\d+[A-Z]+)', name)
     if m:
         return m.group(1)
 
