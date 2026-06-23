@@ -26,8 +26,8 @@ DB_PATH = os.path.join(BASE_DIR, "benchmarks.sqlite")
 SEARCH_URL = "https://browser.geekbench.com/v6/cpu/search?q={query}&sort={sort}&dir={direction}"
 
 # Delays (seconds) between requests to avoid rate limiting
-DELAY_BETWEEN_QUERIES = 2.5  # within same CPU (4 queries)
-DELAY_BETWEEN_CPUS = 3.0     # between different CPUs
+DELAY_BETWEEN_QUERIES = 1.5  # within same CPU (4 queries)
+DELAY_BETWEEN_CPUS = 1.0     # between different CPUs
 
 
 def init_schema(conn):
@@ -57,12 +57,13 @@ def init_schema(conn):
     conn.commit()
 
 
-def get_cpu_names(conn, source=None, limit=None):
+def get_cpu_names(conn, source=None, limit=None, skip=None):
     """Get CPU names to scrape from the database."""
     query = """
         SELECT c.id, c.name
         FROM cpus c
         WHERE 1=1
+        AND NOT EXISTS (SELECT 1 FROM geekbench_search gs WHERE gs.cpu_id = c.id)
     """
     params = []
 
@@ -214,7 +215,7 @@ async def scrape_cpu(browser, cpu_id, cpu_name, delay=DELAY_BETWEEN_QUERIES):
                     direction=direction,
                 )
                 page = await browser.get(url)
-                await asyncio.sleep(6)  # Wait for page + Cloudflare
+                await asyncio.sleep(4)  # Wait for page + Cloudflare
 
                 # Verify page loaded
                 title = await page.evaluate('document.title')
