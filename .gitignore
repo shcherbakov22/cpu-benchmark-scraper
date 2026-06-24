@@ -21,3 +21,4 @@ geekbench_search_results.json
 
 # TSV exports
 clean_all_cpus.tsv
+benchmarks.sqlite
