@@ -26,7 +26,13 @@ from bs4 import BeautifulSoup
 
 DB_PATH = "benchmarks.sqlite"
 OUTPUT = "geekbench_search_results.json"
-DELAY = 0.3
+DELAY = 0.5  # Base delay between requests
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # Seconds to wait on retry
+
+# Worker support for parallel scraping
+WORKER_ID = None
+TOTAL_WORKERS = 1
 
 # Virtualization keywords to filter
 VM_KEYWORDS = ['qemu', 'kvm', 'virtual', 'vmware', 'hyper-v', 'virtualbox', 'xen',
@@ -40,7 +46,18 @@ def sanitize_name(name: str) -> str:
     q = re.sub(r'^AMD\s+(Ryzen|EPYC|Threadripper)\s+', r'\1 ', q, flags=re.I)
     q = re.sub(r'^Qualcomm\s+', '', q, flags=re.I)
     q = re.sub(r'Core\s+Ultra\s+(\d+)\s+(\d+[A-Z]*)\s*Plus\s*$', r'Core Ultra \1 \2', q, flags=re.I)
+
+    # Apple M-series: strip core counts ("M4 Max 16-Core" → "M4 Max")
+    q = re.sub(r'^(M\d+)\s+(Pro|Max)\s+\d+-Core\s*$', r'\1 \2', q, flags=re.I)
+    q = re.sub(r'^(M\d+)\s*$', r'\1', q, flags=re.I)
+
+    # Strip core count suffixes
     q = re.sub(r'\s+(\d+)\s*(Core|Cores?)\s*$', '', q, flags=re.I)
+
+    # Snapdragon X2: simplify
+    q = re.sub(r'Snapdragon\s+X2\s+Elite\s+.*$', r'Snapdragon X2 Elite', q, flags=re.I)
+    q = re.sub(r'Snapdragon\s+X\s+(Elite|Plus)\s+.*$', r'Snapdragon X \1', q, flags=re.I)
+
     q = re.sub(r'[^\w\s\-]', ' ', q)
     q = re.sub(r'\s+', ' ', q).strip()
     return q
@@ -121,6 +138,20 @@ def validate_result(result: dict, db_cores: int = None) -> tuple:
 
     return True, "ok"
 
+def fetch_url(url: str) -> requests.Response:
+    """Fetch URL with retry logic and exponential backoff."""
+    for attempt in range(MAX_RETRIES):
+        r = requests.get(url, impersonate="safari", timeout=20)
+        if r.status_code == 200:
+            return r
+        if r.status_code in (403, 429):
+            wait = RETRY_DELAY * (2 ** attempt) + (WORKER_ID or 0) * 0.5
+            print(f"  ⏳ HTTP {r.status_code}, retrying in {wait:.0f}s...", flush=True)
+            time.sleep(wait)
+        else:
+            return r
+    return r
+
 def scrape_cpu(cpu_id: int, cpu_name: str, db_cores: int) -> dict:
     """Scrape high/low scores for a CPU. Returns dict with all data."""
     q = sanitize_name(cpu_name)
@@ -138,7 +169,7 @@ def scrape_cpu(cpu_id: int, cpu_name: str, db_cores: int) -> dict:
             f"https://browser.geekbench.com/v6/cpu/search"
             f"?q={urllib.parse.quote(q)}&sort=score&score_type={score_type}&order=desc"
         )
-        r = requests.get(url, impersonate="safari", timeout=20)
+        r = fetch_url(url)
         if r.status_code != 200:
             result[f"{score_type}_error"] = f"http_{r.status_code}"
             continue
@@ -155,31 +186,47 @@ def scrape_cpu(cpu_id: int, cpu_name: str, db_cores: int) -> dict:
             result[f"{score_type}_error"] = "no_items"
             continue
 
-        # Parse first item (highest score)
-        high = parse_result_item(items[0])
-        valid, reason = validate_result(high, db_cores)
-        high['valid'] = valid
-        high['validation'] = reason
+        # Parse first valid item (skip results with 0 scores, VMs, etc.)
+        high = None
+        for item in items:
+            parsed = parse_result_item(item)
+            valid, reason = validate_result(parsed, db_cores)
+            parsed['valid'] = valid
+            parsed['validation'] = reason
+            if valid:
+                high = parsed
+                break
+        if high is None:
+            high = parse_result_item(items[0])
+            high['valid'] = False
+            high['validation'] = 'no_valid_result'
 
-        # Get total pages
+        # Get total pages for low scores
         match = re.search(r'(\d+)\s+results?', r.text, re.I)
         total = int(match.group(1)) if match else 0
         last_page = max(1, (total + 29) // 30)
 
+        # Same for low scores
         if last_page > 1:
             time.sleep(DELAY)
             url_last = url + f"&page={last_page}"
-            r2 = requests.get(url_last, impersonate="safari", timeout=20)
+            r2 = fetch_url(url_last)
             if r2.status_code == 200:
                 soup2 = BeautifulSoup(r2.text, "html.parser")
                 items2 = soup2.select(".list-col-inner")
-                if items2:
+                low = None
+                for item in items2:
+                    parsed = parse_result_item(item)
+                    valid, reason = validate_result(parsed, db_cores)
+                    parsed['valid'] = valid
+                    parsed['validation'] = reason
+                    if valid:
+                        low = parsed
+                        break
+                if low is None:
                     low = parse_result_item(items2[0])
-                    valid, reason = validate_result(low, db_cores)
-                    low['valid'] = valid
-                    low['validation'] = reason
-                else:
-                    low = {"error": "no_items_on_last_page"}
+                    low['valid'] = False
+                    low['validation'] = 'no_valid_result'
             else:
                 low = {"error": f"http_{r2.status_code}"}
         else:
@@ -203,6 +250,11 @@ def main():
     for i, arg in enumerate(args):
         if arg == "--limit" and i + 1 < len(args):
             limit = int(args[i + 1])
+        elif arg == "--worker" and i + 1 < len(args):
+            global WORKER_ID, TOTAL_WORKERS
+            WORKER_ID = int(args[i + 1])
+        elif arg == "--workers" and i + 1 < len(args):
+            TOTAL_WORKERS = int(args[i + 1])
 
     conn = sqlite3.connect(DB_PATH)
 
@@ -215,16 +267,24 @@ def main():
     rows = conn.execute(query).fetchall()
     conn.close()
 
+    # Split across workers
+    if WORKER_ID is not None and TOTAL_WORKERS > 1:
+        rows = [r for i, r in enumerate(rows) if i % TOTAL_WORKERS == WORKER_ID]
+        print(f"Worker {WORKER_ID}/{TOTAL_WORKERS}")
+
     if limit:
         rows = rows[:limit]
     total = len(rows)
     print(f"CPUs to scrape: {total}")
 
+    # Per-worker output file
+    worker_output = OUTPUT.replace('.json', f'_{WORKER_ID}.json') if WORKER_ID is not None else OUTPUT
+
     # Load existing results if resuming
     existing = {}
-    if resume and not limit:
+    if resume:
         try:
-            with open(OUTPUT) as f:
+            with open(worker_output) as f:
                 data = json.load(f)
                 existing = {r['cpu_id']: r for r in data}
                 rows = [r for r in rows if r[0] not in existing]
@@ -276,17 +336,17 @@ def main():
 
         # Save periodically
         if i % 50 == 0:
-            with open(OUTPUT, 'w') as f:
+            with open(worker_output, 'w') as f:
                 json.dump(results, f, indent=2)
-            print(f"  → Saved {len(results)} results to {OUTPUT}")
+            print(f"  → Saved {len(results)} results to {worker_output}")
 
     # Final save
-    with open(OUTPUT, 'w') as f:
+    with open(worker_output, 'w') as f:
         json.dump(results, f, indent=2)
 
     print(f"\n{'='*60}")
     print(f"Done! Valid: {success}, Invalid: {failed}, Not found: {no_results}")
-    print(f"Saved {len(results)} results to {OUTPUT}")
+    print(f"Saved {len(results)} results to {worker_output}")
 
 if __name__ == "__main__":
     main()
