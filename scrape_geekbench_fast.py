@@ -27,7 +27,7 @@ DB_PATH = os.path.join(BASE_DIR, "benchmarks.sqlite")
 SEARCH_URL = "https://browser.geekbench.com/v6/cpu/search?q={query}&sort={sort}&dir={direction}"
 CDP_URL = "ws://127.0.0.1:9222/devtools/browser"
 
-REFRESH_INTERVAL = 30  # Refresh cookies every N requests
+REFRESH_INTERVAL = 15  # Refresh cookies every N requests
 
 
 def init_schema(conn):
